@@ -6,14 +6,6 @@ local util = require("conform.util")
 local uv = vim.uv or vim.loop
 local M = {}
 
-local function does_hunk_overlap(hunk_a_start, hunk_a_end, hunk_b_start, hunk_b_end)
-    -- Ensure that start is not greater than end for valid hunks
-    if hunk_a_start > hunk_a_end or hunk_b_start > hunk_b_end then
-        return false
-    end
-    return math.max(hunk_a_start, hunk_b_start) <= math.min(hunk_a_end, hunk_b_end)
-end
-
 ---@class (exact) conform.RunOpts
 ---@field exclusive boolean If true, ensure only a single formatter is running per buffer
 ---@field dry_run boolean If true, do not apply changes and stop after the first formatter attempts to do so
@@ -219,40 +211,16 @@ M.apply_format = function(bufnr, original_lines_param, new_lines_param, range, o
   local user_changed_hunks = {} -- Stores {start_line, end_line} 1-indexed, inclusive, relative to original_lines
 
   if effective_folc then
-    local file_path = vim.api.nvim_buf_get_name(bufnr)
-    if file_path == "" or vim.bo[bufnr].buftype ~= "" then
-      effective_folc = false
-      log.debug("format_only_local_changes disabled for unnamed or special buffer: %s", bufnr)
-    else
-      if vim.fn.filereadable(file_path) == 1 then
-          local saved_lines_content = vim.fn.readfile(file_path)
-          -- Ensure saved_lines_content is a table, even if file is empty
-          if type(saved_lines_content) ~= "table" then saved_lines_content = {} end
-          local saved_lines_for_user_diff = vim.deepcopy(saved_lines_content)
-          table.insert(saved_lines_for_user_diff, "")
-          local saved_text_for_user_diff = table.concat(saved_lines_for_user_diff, "\n")
-          table.remove(saved_lines_for_user_diff)
-
-          local user_diff_indices = vim.diff(saved_text_for_user_diff, original_text_for_diff, { result_type = "indices", algorithm = "histogram" })
-          log.trace("User diff indices (saved vs current buffer before format): %s", user_diff_indices)
-
-          for _, diff_entry in ipairs(user_diff_indices) do
-            local _, _, change_start_in_buffer, change_count_in_buffer = unpack(diff_entry)
-            if change_count_in_buffer > 0 then
-              table.insert(user_changed_hunks, {
-                start_line = change_start_in_buffer, -- 1-indexed
-                end_line = change_start_in_buffer + change_count_in_buffer - 1, -- 1-indexed, inclusive
-              })
-            end
-          end
-          log.trace("User changed hunks (1-indexed, lines in current buffer original_lines): %s", user_changed_hunks)
-          if vim.tbl_isempty(user_changed_hunks) then
-            log.debug("No user changes detected since last save. format_only_local_changes will prevent any formatting.")
-          end
-      else
-          log.warn("File not found on disk for format_only_local_changes diff: %s. Formatting all lines.", file_path)
-          effective_folc = false
-      end
+    user_changed_hunks = util.get_user_changed_hunks(bufnr, original_lines)
+    if vim.tbl_isempty(user_changed_hunks) then
+        log.debug("format_only_local_changes active (CLI), but no user changes from util.get_user_changed_hunks.")
+    end
+    -- Add this check to ensure effective_folc is false if file isn't suitable for diffing
+    local file_path_check = vim.api.nvim_buf_get_name(bufnr)
+    if file_path_check == "" or vim.bo[bufnr].buftype ~= "" or vim.fn.filereadable(file_path_check) == 0 then
+        log.debug("format_only_local_changes (CLI) disabled for new/special/unreadable file.")
+        effective_folc = false
+        user_changed_hunks = {}
     end
   end
 
@@ -286,7 +254,7 @@ M.apply_format = function(bufnr, original_lines_param, new_lines_param, range, o
 
         local overlaps_with_user_change = false
         for _, user_hunk in ipairs(user_changed_hunks) do
-          if does_hunk_overlap(fmt_hunk_start_1idx, fmt_hunk_end_1idx, user_hunk.start_line, user_hunk.end_line) then
+          if util.does_hunk_overlap(fmt_hunk_start_1idx, fmt_hunk_end_1idx, user_hunk.start_line, user_hunk.end_line) then
             overlaps_with_user_change = true
             break
           end

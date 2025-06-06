@@ -601,4 +601,235 @@ print("a")
       vim.api.nvim_set_current_buf(original_current_buf)
     end)
   end)
+
+  local mock_lsp_manager = {}
+  local original_vim_lsp_get_clients = vim.lsp.get_clients
+
+  function mock_lsp_manager.setup_mock_lsp(lsp_method_to_edits_map)
+    vim.lsp.get_clients = function(options)
+      local mock_client = {
+        id = 1,
+        name = "mock_lsp_server",
+        offset_encoding = "utf-8", -- Standard encoding
+        supports_method = function(method)
+          return lsp_method_to_edits_map[method] ~= nil
+        end,
+        request = function(method, params, callback, bufnr_or_ctx)
+          local result_edits = lsp_method_to_edits_map[method]
+          local ctx_to_pass = type(bufnr_or_ctx) == "table" and bufnr_or_ctx or { bufnr = bufnr_or_ctx }
+          if result_edits then
+            vim.schedule(function()
+              callback(nil, result_edits, ctx_to_pass, nil)
+            end)
+            return true, 1 -- Simulate success and a request ID
+          else
+            vim.schedule(function()
+              callback("LSP method " .. method .. " not mocked or no edits defined", nil, ctx_to_pass, nil)
+            end)
+            return false, 1 -- Simulate failure
+          end
+        end,
+        request_sync = function(method, params, timeout_ms, bufnr_param)
+          local result_edits = lsp_method_to_edits_map[method]
+          if result_edits then
+            return { result = result_edits }, nil
+          else
+            return nil, "LSP method " .. method .. " not mocked or no edits defined for sync"
+          end
+        end,
+        -- Add other necessary mock client fields if conform starts using them
+      }
+      if options and options.id and options.id ~= mock_client.id then return {} end
+      if options and options.name and options.name ~= mock_client.name then return {} end
+      if options and options.method and not mock_client.supports_method(options.method) then return {} end
+
+      return { mock_client }
+    end
+  end
+
+  function mock_lsp_manager.teardown_mock_lsp()
+    vim.lsp.get_clients = original_vim_lsp_get_clients
+  end
+
+  describe("format_only_local_changes with LSP", function()
+    local test_file_path
+    local test_bufnr
+    local test_ft = "testfolclsp" -- Unique filetype for these tests
+
+    -- Re-use setup_test_environment and setup_new_file_environment from previous describe block
+    -- Ensure they are accessible or redefine them if scope is an issue.
+    -- For this example, assuming they are accessible or will be copied/adapted.
+    -- If they are not, they would need to be defined here or made available globally in the test file.
+     local function setup_test_environment_lsp(disk_content_lines, buffer_content_lines)
+      local fd, temp_file = vim.loop.fs_mkstemp(".testenv/folc_lsp_test_XXXXXX")
+      assert(fd and temp_file, "Failed to create temp file for LSP test")
+      vim.loop.fs_write(fd, table.concat(disk_content_lines, "\n") .. "\n")
+      vim.loop.fs_close(fd)
+      table.insert(CLEANUP_FILES, temp_file)
+      test_file_path = temp_file
+
+      test_bufnr = vim.api.nvim_create_buf(false, false)
+      vim.api.nvim_buf_set_option(test_bufnr, "bufhidden", "hide")
+      vim.fn.bufload(test_bufnr)
+      vim.api.nvim_buf_set_name(test_bufnr, test_file_path)
+      vim.api.nvim_buf_set_lines(test_bufnr, 0, -1, false, buffer_content_lines)
+      vim.bo[test_bufnr].filetype = test_ft
+      vim.bo[test_bufnr].modified = true
+
+      local original_bufnr = vim.api.nvim_get_current_buf()
+      vim.api.nvim_set_current_buf(test_bufnr)
+      return original_bufnr
+    end
+
+    local function setup_new_file_environment_lsp(buffer_content_lines)
+      test_bufnr = vim.api.nvim_create_buf(false, false)
+      vim.api.nvim_buf_set_option(test_bufnr, "bufhidden", "hide")
+      test_file_path = fs.normalize(".testenv/non_existent_lsp_file_XXXXXX.txt")
+      vim.api.nvim_buf_set_name(test_bufnr, test_file_path)
+      table.insert(CLEANUP_FILES, test_file_path)
+
+      vim.api.nvim_buf_set_lines(test_bufnr, 0, -1, false, buffer_content_lines)
+      vim.bo[test_bufnr].filetype = test_ft
+      vim.bo[test_bufnr].modified = true
+
+      local original_bufnr = vim.api.nvim_get_current_buf()
+      vim.api.nvim_set_current_buf(test_bufnr)
+      return original_bufnr
+    end
+
+    before_each(function()
+      conform.setup({ -- Minimal setup for LSP tests
+        formatters_by_ft = { [test_ft] = {} }, -- No CLI formatters for this ft
+        default_format_opts = { quiet = true },
+      })
+      vim.fn.mkdir(fs.normalize(".testenv"), "p")
+    end)
+
+    after_each(function()
+      mock_lsp_manager.teardown_mock_lsp()
+      test_file_path = nil
+      test_bufnr = nil
+      -- Parent after_each will handle test_util.reset_editor() and CLEANUP_FILES
+    end)
+
+    it("LSP: formats only overlapping user change when format_only_local_changes = true", function()
+      local disk_lines = { "line one", "line two", "line three" }
+      local buffer_lines = { "USER MODIFIED line one", "line two", "USER MODIFIED line three" }
+      local original_buf = setup_test_environment_lsp(disk_lines, buffer_lines)
+
+      mock_lsp_manager.setup_mock_lsp({
+        ["textDocument/formatting"] = {
+          { range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = #(buffer_lines[1]) } }, newText = "LSP: " .. buffer_lines[1] }, -- Overlaps line 1
+          { range = { start = { line = 1, character = 0 }, ["end"] = { line = 1, character = #(buffer_lines[2]) } }, newText = "LSP: " .. buffer_lines[2] }, -- No overlap with user change
+        },
+      })
+
+      conform.format({
+        bufnr = test_bufnr,
+        lsp_format = "first", -- Could be "first", "last", or "prefer"
+        format_only_local_changes = true,
+        formatters = {}, -- Ensure no CLI formatters run
+      })
+
+      local expected_lines = { "LSP: " .. buffer_lines[1], buffer_lines[2], buffer_lines[3] }
+      assert.are.same(expected_lines, vim.api.nvim_buf_get_lines(test_bufnr, 0, -1, false))
+      vim.api.nvim_set_current_buf(original_buf)
+    end)
+
+    it("LSP: formats all lines when format_only_local_changes = false", function()
+      local disk_lines = { "line one", "line two", "line three" }
+      local buffer_lines = { "USER MODIFIED line one", "line two", "line three" }
+      local original_buf = setup_test_environment_lsp(disk_lines, buffer_lines)
+
+      mock_lsp_manager.setup_mock_lsp({
+        ["textDocument/formatting"] = {
+          { range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = #(buffer_lines[1]) } }, newText = "LSP: " .. buffer_lines[1] },
+          { range = { start = { line = 2, character = 0 }, ["end"] = { line = 2, character = #(buffer_lines[3]) } }, newText = "LSP: " .. buffer_lines[3] },
+        },
+      })
+
+      conform.format({
+        bufnr = test_bufnr,
+        lsp_format = "first",
+        format_only_local_changes = false,
+        formatters = {},
+      })
+
+      local expected_lines = { "LSP: " .. buffer_lines[1], buffer_lines[2], "LSP: " .. buffer_lines[3] }
+      assert.are.same(expected_lines, vim.api.nvim_buf_get_lines(test_bufnr, 0, -1, false))
+      vim.api.nvim_set_current_buf(original_buf)
+    end)
+
+    it("LSP: makes no changes if format_only_local_changes = true and no user changes", function()
+      local disk_lines = { "line one", "line two" }
+      local buffer_lines = { "line one", "line two" } -- Same as disk
+      local original_buf = setup_test_environment_lsp(disk_lines, buffer_lines)
+      vim.bo[test_bufnr].modified = false
+
+      mock_lsp_manager.setup_mock_lsp({
+        ["textDocument/formatting"] = {
+          { range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = #(buffer_lines[1]) } }, newText = "LSP: " .. buffer_lines[1] },
+        },
+      })
+
+      conform.format({
+        bufnr = test_bufnr,
+        lsp_format = "first",
+        format_only_local_changes = true,
+        formatters = {},
+      })
+
+      assert.are.same(disk_lines, vim.api.nvim_buf_get_lines(test_bufnr, 0, -1, false))
+      vim.api.nvim_set_current_buf(original_buf)
+    end)
+
+    it("LSP: ignores format_only_local_changes when range is also set (rangeFormatting)", function()
+      local disk_lines = { "line one", "line two", "line three" }
+      local buffer_lines = { "USER MODIFIED line one", "line two", "line three" }
+      local original_buf = setup_test_environment_lsp(disk_lines, buffer_lines)
+
+      mock_lsp_manager.setup_mock_lsp({
+        ["textDocument/rangeFormatting"] = { -- Note: method name change
+          { range = { start = { line = 1, character = 0 }, ["end"] = { line = 1, character = #(buffer_lines[2]) } }, newText = "LSP_RANGE: " .. buffer_lines[2] },
+        },
+      })
+
+      conform.format({
+        bufnr = test_bufnr,
+        lsp_format = "first",
+        format_only_local_changes = true,
+        range = { start = { 2, 0 }, ["end"] = { 2, #(buffer_lines[2]) } }, -- Line 2 (1-indexed for conform)
+        formatters = {},
+      })
+
+      local expected_lines = { buffer_lines[1], "LSP_RANGE: " .. buffer_lines[2], buffer_lines[3] }
+      assert.are.same(expected_lines, vim.api.nvim_buf_get_lines(test_bufnr, 0, -1, false))
+      vim.api.nvim_set_current_buf(original_buf)
+    end)
+
+    it("LSP: formats all lines if format_only_local_changes = true and file is new", function()
+      local buffer_lines = { "new line one", "new line two" }
+      local original_buf = setup_new_file_environment_lsp(buffer_lines)
+      if vim.fn.filereadable(test_file_path) == 1 then vim.fn.delete(test_file_path) end
+
+
+      mock_lsp_manager.setup_mock_lsp({
+        ["textDocument/formatting"] = {
+          { range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = #(buffer_lines[1]) } }, newText = "LSP: " .. buffer_lines[1] },
+          { range = { start = { line = 1, character = 0 }, ["end"] = { line = 1, character = #(buffer_lines[2]) } }, newText = "LSP: " .. buffer_lines[2] },
+        },
+      })
+
+      conform.format({
+        bufnr = test_bufnr,
+        lsp_format = "first",
+        format_only_local_changes = true,
+        formatters = {},
+      })
+
+      local expected_lines = { "LSP: " .. buffer_lines[1], "LSP: " .. buffer_lines[2] }
+      assert.are.same(expected_lines, vim.api.nvim_buf_get_lines(test_bufnr, 0, -1, false))
+      vim.api.nvim_set_current_buf(original_buf)
+    end)
+  end)
 end)

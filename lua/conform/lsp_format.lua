@@ -1,6 +1,7 @@
 ---This module replaces the default vim.lsp.buf.format() so that we can inject our own logic
 local log = require("conform.log")
-local util = require("vim.lsp.util")
+local vim_lsp_util = require("vim.lsp.util")
+local util = require("conform.util")
 
 local M = {}
 
@@ -127,24 +128,37 @@ function M.format(options, callback)
         vim.api.nvim_del_autocmd(auto_id)
         if not result then
           return callback(err or "No result returned from LSP formatter")
-        elseif not vim.api.nvim_buf_is_valid(bufnr) then
+        elseif not vim.api.nvim_buf_is_valid(ctx.bufnr) then -- Use ctx.bufnr here
           return callback("buffer was deleted")
-        elseif changedtick ~= require("conform.util").buf_get_changedtick(bufnr) then
+        elseif changedtick ~= util.buf_get_changedtick(ctx.bufnr) then -- Use util from conform.util
           return callback(
             string.format(
               "Async LSP formatter discarding changes for %s: concurrent modification",
-              vim.api.nvim_buf_get_name(bufnr)
+              vim.api.nvim_buf_get_name(ctx.bufnr)
             )
           )
         else
-          local this_did_edit = apply_text_edits(
-            result,
-            ctx.bufnr,
-            client.offset_encoding,
-            options.dry_run,
-            options.undojoin
-          )
-          changedtick = vim.b[bufnr].changedtick
+          local final_edits = result
+          if options.format_only_local_changes == true and options.range == nil then
+            log.debug("LSP Async: format_only_local_changes is active.")
+            local original_buffer_lines = vim.api.nvim_buf_get_lines(ctx.bufnr, 0, -1, false)
+            local user_hunks = util.get_user_changed_hunks(ctx.bufnr, original_buffer_lines)
+
+            local file_path_check = vim.api.nvim_buf_get_name(ctx.bufnr)
+            if file_path_check == "" or vim.bo[ctx.bufnr].buftype ~= "" or vim.fn.filereadable(file_path_check) == 0 then
+              log.debug("LSP Async: format_only_local_changes effectively disabled for new/special/unreadable file. Applying all LSP edits.")
+              -- final_edits remains 'result' (all edits)
+            elseif vim.tbl_isempty(user_hunks) then
+              log.debug("LSP Async: format_only_local_changes active, but no user changes found. Applying no LSP edits.")
+              final_edits = {}
+            else
+              log.debug("LSP Async: Filtering %d LSP edits by %d user hunks.", #result, #user_hunks)
+              final_edits = util.filter_lsp_text_edits_by_hunks(result, user_hunks)
+            end
+          end
+          -- Then call apply_text_edits with final_edits:
+          local this_did_edit = apply_text_edits(final_edits, ctx.bufnr, client.offset_encoding, options.dry_run, options.undojoin)
+          changedtick = vim.b[ctx.bufnr].changedtick -- Use ctx.bufnr
 
           if options.dry_run and this_did_edit then
             callback(nil, true)
@@ -168,21 +182,35 @@ function M.format(options, callback)
       end
     for _, client in pairs(clients) do
       --- @diagnostic disable-next-line: param-type-mismatch
-      local params = set_range(client, util.make_formatting_params(options.formatting_options))
+      local params = set_range(client, vim_lsp_util.make_formatting_params(options.formatting_options)) -- Use vim_lsp_util
       local result, err = request_sync(client, method, params, timeout_ms, bufnr)
       if result and result.result then
-        local this_did_edit = apply_text_edits(
-          result.result,
-          bufnr,
-          client.offset_encoding,
-          options.dry_run,
-          options.undojoin
-        )
+        local actual_lsp_edits = result.result
+        local final_edits = actual_lsp_edits
+        if options.format_only_local_changes == true and options.range == nil then
+          log.debug("LSP Sync: format_only_local_changes is active.")
+          local original_buffer_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+          local user_hunks = util.get_user_changed_hunks(bufnr, original_buffer_lines)
+
+          local file_path_check = vim.api.nvim_buf_get_name(bufnr)
+          if file_path_check == "" or vim.bo[bufnr].buftype ~= "" or vim.fn.filereadable(file_path_check) == 0 then
+            log.debug("LSP Sync: format_only_local_changes effectively disabled for new/special/unreadable file. Applying all LSP edits.")
+            -- final_edits remains 'actual_lsp_edits'
+          elseif vim.tbl_isempty(user_hunks) then
+            log.debug("LSP Sync: format_only_local_changes active, but no user changes found. Applying no LSP edits.")
+            final_edits = {}
+          else
+            log.debug("LSP Sync: Filtering %d LSP edits by %d user hunks.", #actual_lsp_edits, #user_hunks)
+            final_edits = util.filter_lsp_text_edits_by_hunks(actual_lsp_edits, user_hunks)
+          end
+        end
+        -- Then call apply_text_edits with final_edits:
+        local this_did_edit = apply_text_edits(final_edits, bufnr, client.offset_encoding, options.dry_run, options.undojoin)
         did_edit = did_edit or this_did_edit
 
         if options.dry_run and did_edit then
           callback(nil, true)
-          return true
+          return true -- Return true was missing, but it's in the original code
         end
       elseif err then
         if not options.quiet then
