@@ -6,6 +6,14 @@ local util = require("conform.util")
 local uv = vim.uv or vim.loop
 local M = {}
 
+local function does_hunk_overlap(hunk_a_start, hunk_a_end, hunk_b_start, hunk_b_end)
+    -- Ensure that start is not greater than end for valid hunks
+    if hunk_a_start > hunk_a_end or hunk_b_start > hunk_b_end then
+        return false
+    end
+    return math.max(hunk_a_start, hunk_b_start) <= math.min(hunk_a_end, hunk_b_end)
+end
+
 ---@class (exact) conform.RunOpts
 ---@field exclusive boolean If true, ensure only a single formatter is running per buffer
 ---@field dry_run boolean If true, do not apply changes and stop after the first formatter attempts to do so
@@ -176,16 +184,9 @@ end
 ---@param only_apply_range boolean
 ---@param dry_run boolean
 ---@param undojoin boolean
----@return boolean any_changes
-M.apply_format = function(
-  bufnr,
-  original_lines,
-  new_lines,
-  range,
-  only_apply_range,
-  dry_run,
-  undojoin
-)
+---@param format_only_local_changes_opt boolean
+---@return boolean did_edit
+M.apply_format = function(bufnr, original_lines_param, new_lines_param, range, only_apply_range, dry_run, undojoin, format_only_local_changes_opt)
   if bufnr == 0 then
     bufnr = vim.api.nvim_get_current_buf()
   end
@@ -193,90 +194,144 @@ M.apply_format = function(
     return false
   end
   local bufname = vim.api.nvim_buf_get_name(bufnr)
-  log.trace("Applying formatting to %s", bufname)
-  -- The vim.diff algorithm doesn't handle changes in newline-at-end-of-file well. The unified
-  -- result_type has some text to indicate that the eol changed, but the indices result_type has no
-  -- such indication. To work around this, we just add a trailing newline to the end of both the old
-  -- and the new text.
-  table.insert(original_lines, "")
-  table.insert(new_lines, "")
-  local original_text = table.concat(original_lines, "\n")
-  local new_text = table.concat(new_lines, "\n")
-  table.remove(original_lines)
-  table.remove(new_lines)
+  log.trace("Applying formatting to %s. format_only_local_changes_opt: %s, range: %s", bufname, tostring(format_only_local_changes_opt), range and "yes" or "no")
 
-  -- Abort if output is empty but input is not (i.e. has some non-whitespace characters).
-  -- This is to hack around oddly behaving formatters (e.g black outputs nothing for excluded files).
-  if new_text:match("^%s*$") and not original_text:match("^%s*$") then
+  local original_lines = vim.deepcopy(original_lines_param) -- represents buffer before formatter
+  local new_lines = vim.deepcopy(new_lines_param) -- represents formatter output
+
+  -- Prepare text for vim.diff by adding trailing newlines.
+  local original_lines_for_diff = vim.deepcopy(original_lines)
+  table.insert(original_lines_for_diff, "")
+  local original_text_for_diff = table.concat(original_lines_for_diff, "\n")
+  table.remove(original_lines_for_diff)
+
+  local new_lines_for_diff = vim.deepcopy(new_lines)
+  table.insert(new_lines_for_diff, "")
+  local new_text_for_diff = table.concat(new_lines_for_diff, "\n")
+  table.remove(new_lines_for_diff)
+
+  if new_text_for_diff:match("^%s*\n$") and not original_text_for_diff:match("^%s*\n$") then
     log.warn("Aborting because a formatter returned empty output for buffer %s", bufname)
     return false
   end
 
-  log.trace("Comparing lines %s and %s", original_lines, new_lines)
-  ---@diagnostic disable-next-line: missing-fields
-  local indices = vim.diff(original_text, new_text, {
-    result_type = "indices",
-    algorithm = "histogram",
-  })
-  assert(type(indices) == "table")
-  log.trace("Diff indices %s", indices)
-  local text_edits = {}
-  for _, idx in ipairs(indices) do
-    local orig_line_start, orig_line_count, new_line_start, new_line_count = unpack(idx)
-    local is_insert = orig_line_count == 0
-    local is_delete = new_line_count == 0
-    local is_replace = not is_insert and not is_delete
-    local orig_line_end = orig_line_start + orig_line_count
-    local new_line_end = new_line_start + new_line_count
+  local effective_folc = format_only_local_changes_opt == true and range == nil
+  local user_changed_hunks = {} -- Stores {start_line, end_line} 1-indexed, inclusive, relative to original_lines
 
-    if is_insert then
-      -- When the diff is an insert, it actually means to insert after the mentioned line
-      orig_line_start = orig_line_start + 1
-      orig_line_end = orig_line_end + 1
-    end
+  if effective_folc then
+    local file_path = vim.api.nvim_buf_get_name(bufnr)
+    if file_path == "" or vim.bo[bufnr].buftype ~= "" then
+      effective_folc = false
+      log.debug("format_only_local_changes disabled for unnamed or special buffer: %s", bufnr)
+    else
+      if vim.fn.filereadable(file_path) == 1 then
+          local saved_lines_content = vim.fn.readfile(file_path)
+          -- Ensure saved_lines_content is a table, even if file is empty
+          if type(saved_lines_content) ~= "table" then saved_lines_content = {} end
+          local saved_lines_for_user_diff = vim.deepcopy(saved_lines_content)
+          table.insert(saved_lines_for_user_diff, "")
+          local saved_text_for_user_diff = table.concat(saved_lines_for_user_diff, "\n")
+          table.remove(saved_lines_for_user_diff)
 
-    local replacement = util.tbl_slice(new_lines, new_line_start, new_line_end - 1)
+          local user_diff_indices = vim.diff(saved_text_for_user_diff, original_text_for_diff, { result_type = "indices", algorithm = "histogram" })
+          log.trace("User diff indices (saved vs current buffer before format): %s", user_diff_indices)
 
-    -- For replacement edits, convert the end line to be inclusive
-    if is_replace then
-      orig_line_end = orig_line_end - 1
-    end
-    local should_apply_diff = not only_apply_range
-      or not range
-      or indices_in_range(range, orig_line_start, orig_line_end)
-    if should_apply_diff then
-      local text_edit = create_text_edit(
-        original_lines,
-        replacement,
-        is_insert,
-        is_replace,
-        orig_line_start,
-        orig_line_end
-      )
-      table.insert(text_edits, text_edit)
-
-      -- If we're using the aftermarket range formatting, diffs often have paired delete/insert
-      -- diffs. We should make sure that if one of them overlaps our selected range, extend the
-      -- range so that we pick up the other diff as well.
-      if range and only_apply_range then
-        range = vim.deepcopy(range)
-        range["end"][1] = math.max(range["end"][1], orig_line_end + 1)
+          for _, diff_entry in ipairs(user_diff_indices) do
+            local _, _, change_start_in_buffer, change_count_in_buffer = unpack(diff_entry)
+            if change_count_in_buffer > 0 then
+              table.insert(user_changed_hunks, {
+                start_line = change_start_in_buffer, -- 1-indexed
+                end_line = change_start_in_buffer + change_count_in_buffer - 1, -- 1-indexed, inclusive
+              })
+            end
+          end
+          log.trace("User changed hunks (1-indexed, lines in current buffer original_lines): %s", user_changed_hunks)
+          if vim.tbl_isempty(user_changed_hunks) then
+            log.debug("No user changes detected since last save. format_only_local_changes will prevent any formatting.")
+          end
+      else
+          log.warn("File not found on disk for format_only_local_changes diff: %s. Formatting all lines.", file_path)
+          effective_folc = false
       end
     end
   end
 
-  if not dry_run then
+  local formatter_diff_indices = vim.diff(original_text_for_diff, new_text_for_diff, {
+    result_type = "indices",
+    algorithm = "histogram",
+  })
+  log.trace("Formatter diff indices (original_lines vs new_lines from formatter): %s", formatter_diff_indices)
+  local text_edits = {}
+
+  for _, idx in ipairs(formatter_diff_indices) do
+    local hunk_orig_start, hunk_orig_count, hunk_new_start, hunk_new_count = unpack(idx)
+    local apply_this_formatter_hunk = true
+
+    if effective_folc then
+      if vim.tbl_isempty(user_changed_hunks) then
+        apply_this_formatter_hunk = false
+      else
+        local fmt_hunk_start_1idx = hunk_orig_start
+        local fmt_hunk_end_1idx = hunk_orig_start + hunk_orig_count - 1
+        if hunk_orig_count == 0 then
+          fmt_hunk_start_1idx = hunk_orig_start + 1
+          fmt_hunk_end_1idx = hunk_orig_start + 1
+        elseif hunk_orig_start == 0 and hunk_orig_count == 0 then
+            fmt_hunk_start_1idx = 1
+            fmt_hunk_end_1idx = 1
+        end
+        if fmt_hunk_end_1idx < fmt_hunk_start_1idx then
+            fmt_hunk_end_1idx = fmt_hunk_start_1idx
+        end
+
+        local overlaps_with_user_change = false
+        for _, user_hunk in ipairs(user_changed_hunks) do
+          if does_hunk_overlap(fmt_hunk_start_1idx, fmt_hunk_end_1idx, user_hunk.start_line, user_hunk.end_line) then
+            overlaps_with_user_change = true
+            break
+          end
+        end
+        if not overlaps_with_user_change then
+          apply_this_formatter_hunk = false
+        end
+      end
+    end
+
+    local range_check_passes = not only_apply_range or not range or indices_in_range(range, hunk_orig_start, hunk_orig_start + hunk_orig_count)
+
+    if apply_this_formatter_hunk and range_check_passes then
+      local replacement_content = util.tbl_slice(new_lines, hunk_new_start, hunk_new_start + hunk_new_count - 1)
+      local text_edit = create_text_edit(
+        original_lines,
+        replacement_content,
+        hunk_orig_count == 0,
+        hunk_orig_count > 0 and hunk_new_count > 0,
+        hunk_orig_start,
+        hunk_orig_start + hunk_orig_count
+      )
+      table.insert(text_edits, text_edit)
+
+      if range and only_apply_range then
+        range["end"][1] = math.max(range["end"][1], (hunk_orig_start + hunk_orig_count) + 1)
+      end
+    end
+  end
+
+  if not dry_run and not vim.tbl_isempty(text_edits) then
     log.trace("Applying text edits: %s", text_edits)
     if undojoin then
-      -- may fail if after undo
-      -- Vim:E790: undojoin is not allowed after undo
       pcall(vim.cmd.undojoin)
     end
     vim.lsp.util.apply_text_edits(text_edits, bufnr, "utf-8")
     log.trace("Done formatting %s", bufname)
+    return true
+  elseif dry_run and not vim.tbl_isempty(text_edits) then
+    log.trace("Dry run: Edits would have been applied: %s", text_edits)
+    return true
   end
 
-  return not vim.tbl_isempty(text_edits)
+  log.trace("No text edits applied for %s", bufname)
+  return false
 end
 
 ---@param output? string[]
@@ -521,7 +576,8 @@ end
 ---@param range? conform.Range
 ---@param opts conform.RunOpts
 ---@param callback fun(err?: conform.Error, did_edit?: boolean)
-M.format_async = function(bufnr, formatters, range, opts, callback)
+---@param parent_opts? conform.FormatOpts
+M.format_async = function(bufnr, formatters, range, opts, callback, parent_opts)
   if bufnr == 0 then
     bufnr = vim.api.nvim_get_current_buf()
   end
@@ -561,7 +617,8 @@ M.format_async = function(bufnr, formatters, range, opts, callback)
           range,
           not all_support_range_formatting,
           opts.dry_run,
-          opts.undojoin
+          opts.undojoin,
+          parent_opts and parent_opts.format_only_local_changes or false
         )
       end
       callback(err, did_edit)
@@ -610,9 +667,10 @@ end
 ---@param timeout_ms integer
 ---@param range? conform.Range
 ---@param opts conform.RunOpts
+---@param format_only_local_changes_opt? boolean
 ---@return conform.Error? error
 ---@return boolean did_edit
-M.format_sync = function(bufnr, formatters, timeout_ms, range, opts)
+M.format_sync = function(bufnr, formatters, timeout_ms, range, opts, format_only_local_changes_opt)
   if bufnr == 0 then
     bufnr = vim.api.nvim_get_current_buf()
   end
@@ -636,7 +694,8 @@ M.format_sync = function(bufnr, formatters, timeout_ms, range, opts)
     range,
     not all_support_range_formatting,
     opts.dry_run,
-    opts.undojoin
+    opts.undojoin,
+    format_only_local_changes_opt
   )
   return err, did_edit
 end

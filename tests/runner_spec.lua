@@ -404,4 +404,201 @@ print("a")
       end
     end)
   end)
+
+  describe("format_only_local_changes", function()
+    local test_file_path
+    local test_bufnr
+
+    local function setup_prepend_formatter()
+      conform.setup({
+        formatters = {
+          prepend_formatter = {
+            command = "awk",
+            args = '{print "FORMATTED: " $0}',
+            stdin = true, -- Ensure it processes buffer lines
+          },
+        },
+        formatters_by_ft = {
+          lua = { "prepend_formatter" },
+          text = { "prepend_formatter" },
+        },
+        -- Default to quiet for tests to avoid notification spam
+        default_format_opts = { quiet = true },
+      })
+    end
+
+    local function setup_test_environment(disk_content_lines, buffer_content_lines, ft)
+      -- Create a temporary file for the "on-disk" state
+      local fd, temp_file = vim.loop.fs_mkstemp(".testenv/folc_test_XXXXXX")
+      assert(fd and temp_file, "Failed to create temp file")
+      vim.loop.fs_write(fd, table.concat(disk_content_lines, "\n") .. "\n")
+      vim.loop.fs_close(fd)
+      table.insert(CLEANUP_FILES, temp_file) -- Use existing cleanup
+      test_file_path = temp_file
+
+      -- Create and set up the buffer
+      test_bufnr = vim.api.nvim_create_buf(false, false) -- Not listed, normal buffer
+      vim.api.nvim_buf_set_option(test_bufnr, "bufhidden", "hide")
+      vim.fn.bufload(test_bufnr) -- Load the buffer (needed before setting name)
+      vim.api.nvim_buf_set_name(test_bufnr, test_file_path)
+      vim.api.nvim_buf_set_lines(test_bufnr, 0, -1, false, buffer_content_lines)
+      vim.bo[test_bufnr].filetype = ft or "text"
+      vim.bo[test_bufnr].modified = true -- Simulate user changes making buffer modified
+
+      -- Switch to the test buffer for the duration of the test
+      local original_bufnr = vim.api.nvim_get_current_buf()
+      vim.api.nvim_set_current_buf(test_bufnr)
+      return original_bufnr -- Return original buffer to restore later
+    end
+
+    local function setup_new_file_environment(buffer_content_lines, ft)
+      -- Create a buffer for a new, unsaved file
+      test_bufnr = vim.api.nvim_create_buf(false, false)
+      vim.api.nvim_buf_set_option(test_bufnr, "bufhidden", "hide")
+      -- Assign a name that won't be filereadable initially
+      test_file_path = fs.normalize(".testenv/non_existent_file_XXXXXX.txt")
+      vim.api.nvim_buf_set_name(test_bufnr, test_file_path)
+      table.insert(CLEANUP_FILES, test_file_path) -- Schedule for cleanup if it gets created
+
+      vim.api.nvim_buf_set_lines(test_bufnr, 0, -1, false, buffer_content_lines)
+      vim.bo[test_bufnr].filetype = ft or "text"
+      vim.bo[test_bufnr].modified = true
+
+      local original_bufnr = vim.api.nvim_get_current_buf()
+      vim.api.nvim_set_current_buf(test_bufnr)
+      return original_bufnr
+    end
+
+
+    before_each(function()
+      setup_prepend_formatter()
+      -- Ensure the .testenv directory exists
+      vim.fn.mkdir(fs.normalize(".testenv"), "p")
+    end)
+
+    after_each(function()
+      -- test_util.reset_editor() is called by the parent describe's after_each
+      -- We just need to ensure our specific test file is cleaned up if created
+      -- The global CLEANUP_FILES should handle this
+      test_file_path = nil
+      test_bufnr = nil
+    end)
+
+    it("formats only changed line when format_only_local_changes = true", function()
+      local disk_lines = { "line1", "line2", "line3" }
+      local buffer_lines = { "line1", "USER_CHANGED line2", "line3" }
+      local original_current_buf = setup_test_environment(disk_lines, buffer_lines, "text")
+
+      conform.format({
+        bufnr = test_bufnr,
+        formatters = { "prepend_formatter" },
+        format_only_local_changes = true,
+      })
+
+      local expected_lines = { "line1", "FORMATTED: USER_CHANGED line2", "line3" }
+      assert.are.same(expected_lines, vim.api.nvim_buf_get_lines(test_bufnr, 0, -1, false))
+      vim.api.nvim_set_current_buf(original_current_buf) -- Restore original buffer
+    end)
+
+    it("formats all lines when format_only_local_changes = false", function()
+      local disk_lines = { "line1", "line2", "line3" }
+      local buffer_lines = { "line1", "USER_CHANGED line2", "line3" }
+      local original_current_buf = setup_test_environment(disk_lines, buffer_lines, "text")
+
+      conform.format({
+        bufnr = test_bufnr,
+        formatters = { "prepend_formatter" },
+        format_only_local_changes = false,
+      })
+
+      local expected_lines = { "FORMATTED: line1", "FORMATTED: USER_CHANGED line2", "FORMATTED: line3" }
+      assert.are.same(expected_lines, vim.api.nvim_buf_get_lines(test_bufnr, 0, -1, false))
+      vim.api.nvim_set_current_buf(original_current_buf)
+    end)
+
+    it("formats all lines by default (format_only_local_changes not set)", function()
+      local disk_lines = { "line1", "line2", "line3" }
+      local buffer_lines = { "line1", "USER_CHANGED line2", "line3" }
+      local original_current_buf = setup_test_environment(disk_lines, buffer_lines, "text")
+
+      conform.format({
+        bufnr = test_bufnr,
+        formatters = { "prepend_formatter" },
+      })
+
+      local expected_lines = { "FORMATTED: line1", "FORMATTED: USER_CHANGED line2", "FORMATTED: line3" }
+      assert.are.same(expected_lines, vim.api.nvim_buf_get_lines(test_bufnr, 0, -1, false))
+      vim.api.nvim_set_current_buf(original_current_buf)
+    end)
+
+    it("makes no changes if format_only_local_changes = true and no user changes", function()
+      local disk_lines = { "line1", "line2", "line3" }
+      local buffer_lines = { "line1", "line2", "line3" } -- Same as disk
+      local original_current_buf = setup_test_environment(disk_lines, buffer_lines, "text")
+      vim.bo[test_bufnr].modified = false -- Explicitly set not modified
+
+      conform.format({
+        bufnr = test_bufnr,
+        formatters = { "prepend_formatter" },
+        format_only_local_changes = true,
+      })
+
+      local expected_lines = { "line1", "line2", "line3" }
+      assert.are.same(expected_lines, vim.api.nvim_buf_get_lines(test_bufnr, 0, -1, false))
+      vim.api.nvim_set_current_buf(original_current_buf)
+    end)
+
+    it("formats only multiple disjoint user changes when format_only_local_changes = true", function()
+      local disk_lines = { "line_a", "line_b", "line_c", "line_d" }
+      local buffer_lines = { "USER_A line_a", "line_b", "USER_C line_c", "line_d" }
+      local original_current_buf = setup_test_environment(disk_lines, buffer_lines, "text")
+
+      conform.format({
+        bufnr = test_bufnr,
+        formatters = { "prepend_formatter" },
+        format_only_local_changes = true,
+      })
+
+      local expected_lines = { "FORMATTED: USER_A line_a", "line_b", "FORMATTED: USER_C line_c", "line_d" }
+      assert.are.same(expected_lines, vim.api.nvim_buf_get_lines(test_bufnr, 0, -1, false))
+      vim.api.nvim_set_current_buf(original_current_buf)
+    end)
+
+    it("ignores format_only_local_changes when range is also set", function()
+      local disk_lines = { "line1", "line2", "line3" }
+      local buffer_lines = { "USER_CHANGED line1", "line2", "line3" }
+      local original_current_buf = setup_test_environment(disk_lines, buffer_lines, "text")
+
+      conform.format({
+        bufnr = test_bufnr,
+        formatters = { "prepend_formatter" },
+        format_only_local_changes = true,
+        range = { start = { 2, 0 }, ["end"] = { 2, vim.fn.strlen("line2") } }, -- Line 2 (1-indexed)
+      })
+
+      -- Expected: only line 2 is formatted due to range, line 1 is untouched despite being a user change
+      local expected_lines = { "USER_CHANGED line1", "FORMATTED: line2", "line3" }
+      assert.are.same(expected_lines, vim.api.nvim_buf_get_lines(test_bufnr, 0, -1, false))
+      vim.api.nvim_set_current_buf(original_current_buf)
+    end)
+
+    it("formats all lines if format_only_local_changes = true and file is new (not on disk)", function()
+      local buffer_lines = { "newline1", "newline2" }
+      local original_current_buf = setup_new_file_environment(buffer_lines, "text")
+      -- Ensure file does not exist for this test
+      if vim.fn.filereadable(test_file_path) == 1 then
+        vim.fn.delete(test_file_path)
+      end
+
+      conform.format({
+        bufnr = test_bufnr,
+        formatters = { "prepend_formatter" },
+        format_only_local_changes = true,
+      })
+
+      local expected_lines = { "FORMATTED: newline1", "FORMATTED: newline2" }
+      assert.are.same(expected_lines, vim.api.nvim_buf_get_lines(test_bufnr, 0, -1, false))
+      vim.api.nvim_set_current_buf(original_current_buf)
+    end)
+  end)
 end)
