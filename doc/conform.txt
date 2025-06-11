@@ -37,6 +37,8 @@ OPTIONS                                                          *conform-option
       -- This will also affect the default values for format_on_save/format_after_save
       default_format_opts = {
         lsp_format = "fallback",
+        -- If true, only format lines that have been changed since the last save. Defaults to false.
+        format_only_local_changes = false,
       },
       -- If this is set, Conform will run the formatter on save.
       -- It will pass the table to conform.format().
@@ -149,6 +151,9 @@ setup({opts})                                                      *conform.setu
                                  warnings or failures. Defaults to false.
               {stop_after_first} `nil|boolean` Only run the first available
                                  formatter in the list. Defaults to false.
+          {format_only_local_changes} `nil|boolean` If true, only format lines
+                             that have been changed since the last save.
+                             Defaults to false.
           {format_after_save} `nil|conform.FormatOpts|fun(bufnr: integer): nil|conform.FormatOpts`
                              , nil|fun(err: nil|string, did_edit: nil|boolean)
                              If this is set, Conform will run the formatter
@@ -202,6 +207,20 @@ format({opts}, {callback}): boolean                               *conform.forma
                              formatter in the list. Defaults to false.
           {quiet}            `nil|boolean` Don't show any notifications for
                              warnings or failures. Defaults to false.
+          {format_only_local_changes} `nil|boolean` If true, only format lines
+                             that have been changed by the user since the file
+                             was last saved. This is achieved by comparing the
+                             current buffer content against the last saved state
+                             on disk to identify user-modified lines, and then
+                             filtering the formatter's (both CLI and LSP)
+                             proposed changes to apply only to those lines.
+                             This option is overridden if an explicit `range`
+                             is set (e.g., by visual selection). Defaults to
+                             `false`, or the value set in `default_format_opts`.
+                             For new or special buffers where a disk comparison
+                             isn't possible, this option will effectively be
+                             disabled, and formatters will apply to their usual
+                             scope (e.g., full file or given range).
           {range}            `nil|conform.Range` Range to format. Table must
                              contain `start` and `end` keys with {row, col}
                              tuples using (1,0) indexing. Defaults to current

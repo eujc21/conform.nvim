@@ -53,6 +53,13 @@ M.root_file = function(files)
   end
 end
 
+M.does_hunk_overlap = function(hunk_a_start, hunk_a_end, hunk_b_start, hunk_b_end)
+    if hunk_a_start > hunk_a_end or hunk_b_start > hunk_b_end then
+        return false
+    end
+    return math.max(hunk_a_start, hunk_b_start) <= math.min(hunk_a_end, hunk_b_end)
+end
+
 ---@param bufnr integer
 ---@param range conform.Range
 ---@return integer start_offset
@@ -244,6 +251,111 @@ M.shell_build_argv = function(cmd)
 
   table.insert(argv, cmd)
   return argv
+end
+
+--- Filters LSP TextEdit objects based on overlap with user-defined hunks.
+--- @param lsp_edits table[] Array of LSP TextEdit objects. Ranges are 0-indexed.
+---    Each TextEdit: { range = { start = { line = L, character = C }, end = { line = L, character = C } }, newText = "..." }
+--- @param user_hunks table[] Array of user hunk objects. Line numbers are 1-indexed, inclusive.
+---    Each hunk: { start_line = SL, end_line = EL }
+--- @return table[] Filtered array of LSP TextEdit objects.
+M.filter_lsp_text_edits_by_hunks = function(lsp_edits, user_hunks)
+  if not lsp_edits or vim.tbl_isempty(lsp_edits) then
+    return {}
+  end
+  if not user_hunks or vim.tbl_isempty(user_hunks) then
+    -- If there are no user changes, no LSP edits should be applied if filtering is active.
+    return {}
+  end
+
+  local filtered_edits = {}
+  local log = require("conform.log") -- For debugging, if needed
+
+  log.trace("Filtering LSP edits. Total LSP edits: %d, Total user hunks: %d", #lsp_edits, #user_hunks)
+  -- log.trace("LSP Edits: %s", lsp_edits) -- Careful: can be very verbose
+  -- log.trace("User Hunks (1-indexed): %s", user_hunks)
+
+  for _, lsp_edit in ipairs(lsp_edits) do
+    -- LSP ranges are 0-indexed. Convert to 1-indexed for comparison with user_hunks.
+    -- Add 1 to line numbers.
+    local lsp_edit_start_line_1idx = lsp_edit.range.start.line + 1
+    local lsp_edit_end_line_1idx = lsp_edit.range["end"].line + 1
+
+    -- Ensure end is not less than start for the LSP edit itself (e.g. single line insert)
+    if lsp_edit_end_line_1idx < lsp_edit_start_line_1idx then
+        lsp_edit_end_line_1idx = lsp_edit_start_line_1idx
+    end
+
+    log.trace("Processing LSP edit (1-indexed range): lines %d-%d", lsp_edit_start_line_1idx, lsp_edit_end_line_1idx)
+
+    local overlaps = false
+    for _, user_hunk in ipairs(user_hunks) do
+      log.trace("  Comparing with user hunk: lines %d-%d", user_hunk.start_line, user_hunk.end_line)
+      if M.does_hunk_overlap(lsp_edit_start_line_1idx, lsp_edit_end_line_1idx, user_hunk.start_line, user_hunk.end_line) then
+        overlaps = true
+        log.trace("    Overlap found with user hunk: lines %d-%d. Including this LSP edit.", user_hunk.start_line, user_hunk.end_line)
+        break
+      end
+    end
+
+    if overlaps then
+      table.insert(filtered_edits, lsp_edit)
+    else
+      log.trace("    No overlap found for LSP edit (1-indexed range %d-%d) with any user hunk. Discarding.", lsp_edit_start_line_1idx, lsp_edit_end_line_1idx)
+    end
+  end
+
+  log.trace("Finished filtering LSP edits. Original count: %d, Filtered count: %d", #lsp_edits, #filtered_edits)
+  return filtered_edits
+end
+
+--- Identifies lines changed by the user compared to the last saved version of the file.
+--- @param bufnr integer The buffer number.
+--- @param current_buffer_lines table Array of strings representing lines in the buffer.
+--- @return table Array of hunk objects {start_line=S, end_line=E} (1-indexed, inclusive),
+---               or an empty table if no changes or not applicable.
+M.get_user_changed_hunks = function(bufnr, current_buffer_lines)
+  local log = require("conform.log")
+  local user_changed_hunks = {}
+  local file_path = vim.api.nvim_buf_get_name(bufnr)
+
+  if file_path == "" or vim.bo[bufnr].buftype ~= "" then
+    log.debug("get_user_changed_hunks: Cannot get hunks for unnamed or special buffer: %s", bufnr)
+    return {}
+  end
+
+  if vim.fn.filereadable(file_path) == 1 then
+    local saved_lines_content = vim.fn.readfile(file_path)
+    if type(saved_lines_content) ~= "table" then saved_lines_content = {} end
+
+    local saved_lines_for_diff = vim.deepcopy(saved_lines_content)
+    table.insert(saved_lines_for_diff, "")
+    local saved_text_for_diff = table.concat(saved_lines_for_diff, "\n")
+    table.remove(saved_lines_for_diff)
+
+    local buffer_lines_for_diff = vim.deepcopy(current_buffer_lines)
+    table.insert(buffer_lines_for_diff, "")
+    local buffer_text_for_diff = table.concat(buffer_lines_for_diff, "\n")
+    table.remove(buffer_lines_for_diff)
+
+    local user_diff_indices = vim.diff(saved_text_for_diff, buffer_text_for_diff, { result_type = "indices", algorithm = "histogram" })
+    log.trace("get_user_changed_hunks: User diff indices (saved vs current buffer): %s", user_diff_indices)
+
+    for _, diff_entry in ipairs(user_diff_indices) do
+      local _, _, change_start_in_buffer, change_count_in_buffer = unpack(diff_entry)
+      if change_count_in_buffer > 0 then
+        table.insert(user_changed_hunks, {
+          start_line = change_start_in_buffer, -- 1-indexed
+          end_line = change_start_in_buffer + change_count_in_buffer - 1, -- 1-indexed, inclusive
+        })
+      end
+    end
+    log.trace("get_user_changed_hunks: User changed hunks (1-indexed): %s", user_changed_hunks)
+  else
+    log.debug("get_user_changed_hunks: File not found on disk: %s. No hunks.", file_path)
+    return {}
+  end
+  return user_changed_hunks
 end
 
 return M

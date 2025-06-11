@@ -10,7 +10,9 @@ M.notify_on_error = true
 M.notify_no_formatters = true
 
 ---@type conform.DefaultFormatOpts
-M.default_format_opts = {}
+M.default_format_opts = {
+  format_only_local_changes = false,
+}
 
 -- Defer notifications because nvim-notify can throw errors if called immediately
 -- in some contexts (e.g. inside statusline function)
@@ -21,7 +23,7 @@ local notify_once = vim.schedule_wrap(function(...)
   vim.notify_once(...)
 end)
 
-local allowed_default_opts = { "timeout_ms", "lsp_format", "quiet", "stop_after_first" }
+local allowed_default_opts = { "timeout_ms", "lsp_format", "quiet", "stop_after_first", "format_only_local_changes" }
 local allowed_default_filetype_opts = { "name", "id", "filter" }
 ---@param a table
 ---@param b table
@@ -434,6 +436,7 @@ M.format = function(opts, callback)
     quiet = false,
     undojoin = false,
     stop_after_first = false,
+    format_only_local_changes = false,
   })
   if opts.bufnr == 0 then
     opts.bufnr = vim.api.nvim_get_current_buf()
@@ -513,10 +516,12 @@ M.format = function(opts, callback)
     ---@type conform.RunOpts
     local run_opts = { exclusive = true, dry_run = opts.dry_run, undojoin = opts.undojoin }
     if opts.async then
-      runner.format_async(opts.bufnr, formatters, opts.range, run_opts, cb)
+      -- Pass the main opts table which includes format_only_local_changes
+      runner.format_async(opts.bufnr, formatters, opts.range, run_opts, cb, opts) -- Pass full opts
     else
+      -- Synchronous path
       local err, did_edit =
-        runner.format_sync(opts.bufnr, formatters, opts.timeout_ms, opts.range, run_opts)
+        runner.format_sync(opts.bufnr, formatters, opts.timeout_ms, opts.range, run_opts, opts.format_only_local_changes) -- Added opts.format_only_local_changes
       cb(err, did_edit)
     end
   end
